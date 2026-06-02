@@ -1,0 +1,242 @@
+================================================================================
+NON-FUNCTIONAL REQUIREMENTS
+Fundamentals Data Collection Pipeline (LLM-based, multi-sector)
+================================================================================
+
+These NFRs define the quality attributes the pipeline must meet. They are
+deliberately measurable so that compliance can be verified by automated
+tests, dashboards, and SLOs.
+
+================================================================================
+1. ACCURACY & DATA QUALITY
+================================================================================
+
+NFR-1.1  Numeric extraction accuracy on the primary financial statements
+         (income statement, balance sheet, cash flow) MUST be >= 99.5%
+         exact-match against a held-out gold set of >= 200 filings spanning
+         all covered sectors. Exact match = same canonical_name, same
+         normalized_value (within rounding tolerance), same period.
+
+NFR-1.2  Sign convention errors (parenthetical negatives flipped, expense
+         signs reversed) MUST be < 0.05% of extracted values.
+
+NFR-1.3  Currency and scale detection MUST be correct on >= 99.9% of tables.
+         Misclassification of scale (e.g. millions read as thousands) is
+         considered a P0 defect.
+
+NFR-1.4  Mathematical relationship identities (FR-5.x) MUST hold for >= 99%
+         of validated facts after extraction, with the remaining < 1%
+         flagged for human review rather than silently passed.
+
+NFR-1.5  Per-period date resolution accuracy MUST be 100% (period_end_date
+         and period_type must always be correct or the fact is rejected).
+
+NFR-1.6  Canonical taxonomy mapping precision MUST be >= 98%; recall on
+         known canonical line items MUST be >= 99%. Unmapped items MUST be
+         routed to review, never dropped.
+
+================================================================================
+2. PERFORMANCE & THROUGHPUT
+================================================================================
+
+NFR-2.1  End-to-end latency from document arrival to facts available in the
+         fact store MUST be:
+            - p50 <= 5 minutes for a 10-Q (~80 pages)
+            - p95 <= 15 minutes for a 10-K (~250 pages)
+            - p99 <= 45 minutes for a 10-K with > 400 pages
+
+NFR-2.2  The system MUST sustain 200 concurrent document extractions without
+         degrading p95 latency by more than 25%.
+
+NFR-2.3  Steady-state throughput MUST be >= 5,000 documents per day on the
+         standard cluster size, with burst capacity of 20,000 documents per
+         day during 10-K / 10-Q filing peaks (Feb / May / Aug / Nov).
+
+NFR-2.4  LLM call retries with exponential backoff MUST not block the
+         document queue for more than 30 seconds before the document is
+         re-queued.
+
+================================================================================
+3. SCALABILITY
+================================================================================
+
+NFR-3.1  All extraction stages MUST be horizontally scalable: ingest,
+         pre-process, LLM extraction, validation, persistence.
+
+NFR-3.2  The fact store MUST scale to >= 1 billion fact rows with sub-second
+         lookup by (issuer, period, canonical_name).
+
+NFR-3.3  Adding a new sector taxonomy or relationship hierarchy MUST NOT
+         require redeploying core services. Taxonomies are loaded from
+         configuration at runtime.
+
+NFR-3.4  Onboarding a new document format MUST be a configuration + prompt
+         change with a regression run on the gold set, not a code change to
+         core extractors.
+
+================================================================================
+4. RELIABILITY & AVAILABILITY
+================================================================================
+
+NFR-4.1  Pipeline availability target: 99.9% monthly (excluding scheduled
+         maintenance windows announced 7 days in advance).
+
+NFR-4.2  No single LLM provider outage may halt extraction. The system MUST
+         support multi-provider routing (primary + fallback) with automatic
+         failover on provider 5xx, rate-limit, or timeout errors.
+
+NFR-4.3  Every stage MUST be idempotent. Reprocessing the same document
+         MUST produce the same fact_ids and the same normalized values
+         (subject to model_version), and MUST NOT produce duplicate facts.
+
+NFR-4.4  Crash recovery: a worker process killed mid-extraction MUST resume
+         from the last checkpointed stage with no data loss and no double
+         billing of LLM calls (idempotency keys on outbound calls).
+
+NFR-4.5  Data durability: raw documents and extracted facts MUST be stored
+         with >= 99.999999999% (11 nines) durability and replicated across
+         at least two availability zones.
+
+================================================================================
+5. COST
+================================================================================
+
+NFR-5.1  LLM cost per document MUST be tracked and exposed per stage. Target
+         steady-state cost:
+            - 10-Q: <= $0.50 per document, fully extracted
+            - 10-K: <= $2.00 per document, fully extracted
+            - Earnings release: <= $0.25 per document
+
+NFR-5.2  Prompt caching MUST be used for any repeated context (taxonomy,
+         system prompt, sector instructions) to reduce input token cost by
+         >= 70% on cache hits.
+
+NFR-5.3  The system MUST batch LLM calls where it does not harm latency
+         (e.g. via batch APIs for re-extraction backfills).
+
+NFR-5.4  Cost budgets MUST be enforceable per tenant / per sector with
+         alerting at 80% and a hard stop at 100% (configurable to soft stop).
+
+================================================================================
+6. OBSERVABILITY
+================================================================================
+
+NFR-6.1  Every document MUST emit a per-stage trace (ingest -> classify ->
+         segment -> extract -> validate -> persist) with timing, token usage,
+         and error codes, queryable for at least 90 days.
+
+NFR-6.2  Metrics that MUST be exported (Prometheus / OpenTelemetry):
+         - documents_ingested_total
+         - extraction_latency_seconds (histogram, by stage and sector)
+         - extraction_confidence (histogram)
+         - identity_validation_failures_total (by identity_id, sector)
+         - llm_tokens_used_total (by model, stage, cache_hit)
+         - llm_cost_usd_total (by model, tenant)
+         - review_queue_depth (gauge)
+         - review_resolution_latency_seconds (histogram)
+
+NFR-6.3  Dashboards MUST exist for: extraction accuracy vs gold set,
+         identity-failure rate by sector, cost per document trend, review
+         backlog, and LLM provider health.
+
+NFR-6.4  Structured logs MUST include document_id, fact_id, model_version,
+         and prompt_version on every relevant log line for traceability.
+
+NFR-6.5  Alerts MUST fire on: extraction accuracy drop > 1% week-over-week,
+         identity failure rate > 2% in any sector, p95 latency breach,
+         cost per document up > 25% week-over-week, review backlog > 1000.
+
+================================================================================
+7. SECURITY & COMPLIANCE
+================================================================================
+
+NFR-7.1  All data in transit MUST use TLS 1.2+; all data at rest MUST be
+         encrypted with AES-256 (KMS-managed keys).
+
+NFR-7.2  Access to raw documents and facts MUST be RBAC-controlled with
+         least privilege. Service accounts MUST be scoped per stage.
+
+NFR-7.3  PII / MNPI handling: although filings are public, the pipeline MUST
+         be deployable in environments where filings under embargo (pre-
+         release earnings) are processed. In that mode, no fact may leave
+         the secure tenant boundary until the embargo lifts.
+
+NFR-7.4  LLM provider routing MUST honor an allow-list per tenant and per
+         data classification; configuration changes MUST be auditable.
+
+NFR-7.5  All audit logs MUST be tamper-evident (append-only, hash-chained
+         or WORM storage) and retained for >= 7 years.
+
+NFR-7.6  Right-to-delete: tenant data MUST be deletable end-to-end (raw
+         documents, intermediate artifacts, facts, logs) within 30 days of
+         a verified request.
+
+================================================================================
+8. MAINTAINABILITY & EXTENSIBILITY
+================================================================================
+
+NFR-8.1  Taxonomy, relationship hierarchy, and prompt templates MUST be
+         declarative, versioned, code-reviewed, and deployable independent
+         of service binaries.
+
+NFR-8.2  Adding a new line item to the taxonomy MUST take < 1 day end-to-end
+         (define canonical name, add label aliases, add identity links if
+         applicable, run regression).
+
+NFR-8.3  Every prompt change MUST run against the gold-set regression
+         harness and report deltas in accuracy, identity-failure rate, and
+         cost before being promoted to production.
+
+NFR-8.4  The codebase MUST maintain >= 80% unit-test coverage on extraction
+         normalization logic (sign, scale, currency, period parsing) and
+         100% on identity validation logic.
+
+================================================================================
+9. AUDITABILITY & REPRODUCIBILITY
+================================================================================
+
+NFR-9.1  Every fact MUST be reproducible from (document_id, model_version,
+         prompt_version, taxonomy_version): re-running with the same inputs
+         MUST yield the same normalized value within rounding tolerance.
+
+NFR-9.2  Source attribution MUST be lossless: page number, bounding box,
+         and the source table cell MUST be retrievable for every fact.
+
+NFR-9.3  All inputs to the LLM (prompt, system prompt, page image, prior
+         context) and outputs (raw response, parsed JSON, post-processing
+         steps) MUST be retained for >= 1 year for forensic analysis.
+
+================================================================================
+10. USABILITY (REVIEW UI / API CONSUMERS)
+================================================================================
+
+NFR-10.1 The review UI MUST allow a reviewer to resolve a flagged fact in
+         <= 30 seconds for routine cases (page navigation, accept/edit,
+         reason selection).
+
+NFR-10.2 API responses MUST follow consistent JSON conventions, paginated,
+         with stable schema versioning. Breaking changes require a new
+         major API version with >= 6 months of backward compatibility.
+
+NFR-10.3 Documentation MUST cover: taxonomy reference, relationship
+         hierarchy reference, API reference, prompt-version changelog,
+         and a runbook for common operational issues.
+
+================================================================================
+11. PORTABILITY & DEPLOYMENT
+================================================================================
+
+NFR-11.1 The pipeline MUST run on Kubernetes (EKS / GKE / AKS) without
+         cloud-specific dependencies in the core extraction logic.
+
+NFR-11.2 Object storage and message queue MUST be abstracted so the
+         pipeline can run on AWS (S3 + SQS / SNS), GCP (GCS + Pub/Sub),
+         or Azure (Blob + Service Bus) with configuration changes only.
+
+NFR-11.3 A complete local-dev environment (docker-compose) MUST exist that
+         runs the pipeline end-to-end on sample documents using a small
+         LLM or a recorded-response mock, for fast iteration without cost.
+
+================================================================================
+END OF NON-FUNCTIONAL REQUIREMENTS
+================================================================================

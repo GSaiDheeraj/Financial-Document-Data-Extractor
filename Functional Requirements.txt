@@ -1,0 +1,389 @@
+================================================================================
+FUNCTIONAL REQUIREMENTS
+Fundamentals Data Collection Pipeline (LLM-based, multi-sector)
+================================================================================
+
+PURPOSE
+-------
+The pipeline ingests financial documents published by public companies across
+all sectors (banks, insurance, industrials, technology, utilities, REITs,
+energy, healthcare, etc.) and extracts every numeric fundamental line item
+together with the metadata required to interpret it correctly (period type,
+period end date, reporting currency, scale, consolidation level, restatement
+flag, segment, and source location). Extracted data must satisfy the
+mathematical roll-up identities defined in the relationship hierarchy.
+
+================================================================================
+1. DOCUMENT INGESTION
+================================================================================
+
+FR-1.1  The system MUST accept the following document formats:
+        - SEC 10-K (annual report, PDF + HTML)
+        - SEC 10-Q (quarterly report, PDF + HTML)
+        - SEC 8-K and earnings releases / press releases (PDF, HTML)
+        - Earnings supplemental schedules and financial supplements (PDF, XLSX)
+        - Investor presentations / earnings decks (PDF, PPTX exported as PDF)
+        - XBRL / iXBRL instance documents (XML / .xbrl)
+        - Foreign filings: 20-F, 40-F, 6-K, annual reports for non-US issuers
+          (PDF, HTML)
+        - Proxy statements (DEF 14A) when they contain financial summaries
+
+FR-1.2  The system MUST accept documents via:
+        - Bulk upload (S3 / object store prefix)
+        - SEC EDGAR scheduled crawl (CIK or ticker driven)
+        - Manual upload (single document, ad-hoc reprocessing)
+        - Webhook / event trigger (new filing notification)
+
+FR-1.3  Each ingested document MUST be assigned a stable document_id and
+        persisted in raw form (immutable) before any processing begins.
+
+FR-1.4  The system MUST capture document-level metadata at ingest:
+        - issuer (CIK, ticker, LEI, legal name)
+        - filing type (10-K, 10-Q, 8-K, earnings release, etc.)
+        - filing date and period end date
+        - fiscal year and fiscal quarter
+        - source URL / source system
+        - language (default: en)
+        - file hash (SHA-256) for deduplication
+
+FR-1.5  The system MUST detect and skip exact duplicates (same hash) and
+        flag near-duplicates (same issuer + period + filing type) for review.
+
+================================================================================
+2. DOCUMENT PRE-PROCESSING
+================================================================================
+
+FR-2.1  The system MUST classify each document by:
+        - document type (filing type)
+        - issuer industry / sector (GICS or SIC) for taxonomy selection
+        - reporting framework (US GAAP, IFRS, statutory, other)
+
+FR-2.2  The system MUST segment the document into logical sections, including:
+        - Consolidated Income Statement / Statement of Operations
+        - Consolidated Balance Sheet / Statement of Financial Position
+        - Consolidated Cash Flow Statement
+        - Statement of Changes in Equity
+        - Statement of Comprehensive Income
+        - Notes to Financial Statements
+        - Segment Disclosures
+        - MD&A
+        - Selected Financial Data / Five-Year Summary
+
+FR-2.3  For PDF input, the system MUST extract per-page rendered images at
+        sufficient DPI (>= 200 DPI) for downstream vision-LLM extraction, and
+        MUST also extract the underlying text layer when present.
+
+FR-2.4  The system MUST detect tables within each section and pass each
+        candidate financial table to extraction with surrounding context
+        (table title, column headers, footnotes, units-of-measure note).
+
+================================================================================
+3. LINE-ITEM EXTRACTION (CORE)
+================================================================================
+
+FR-3.1  The system MUST extract every numeric line item present in every
+        primary financial statement. Coverage MUST include, but is not
+        limited to:
+
+        Income Statement:
+            Revenue / Net Revenue / Total Net Revenues / Net Sales
+            Net Interest Income (banks)
+            Non-Interest Income (banks)
+            Premium Income (insurance)
+            Cost of Revenue / Cost of Goods Sold / Cost of Services
+            Gross Profit
+            Research & Development
+            Selling, General & Administrative
+            Other Operating Expenses
+            Provision for Credit Losses (banks)
+            Claims & Benefits Incurred (insurance)
+            Total Operating Expenses
+            Operating Income / Operating Profit / Income from Operations
+            Interest Income (non-bank)
+            Interest Expense
+            Other Non-Operating Income / (Expense)
+            Income Before Income Tax Expense
+            Income Tax Expense / (Benefit)
+            Net Income from Continuing Operations
+            Net Income from Discontinued Operations
+            Net Income
+            Net Income Attributable to Non-Controlling Interests
+            Net Income Attributable to Common Shareholders
+            Basic EPS, Diluted EPS
+            Basic Weighted-Average Shares, Diluted Weighted-Average Shares
+            Dividends per Share
+
+        Balance Sheet:
+            Cash and Cash Equivalents
+            Short-Term Investments / Marketable Securities
+            Accounts Receivable, net
+            Allowance for Credit Losses
+            Inventories
+            Prepaid Expenses
+            Total Current Assets
+            Property, Plant & Equipment, net
+            Goodwill
+            Intangible Assets, net
+            Right-of-Use Assets
+            Investments in Equity Method / Affiliates
+            Loans, net (banks)
+            Allowance for Loan Losses (banks)
+            Trading Assets / Securities (banks)
+            Deferred Tax Assets
+            Other Assets
+            Total Assets
+            Accounts Payable
+            Accrued Liabilities
+            Short-Term Debt / Current Portion of Long-Term Debt
+            Deposits (banks)
+            Insurance Reserves (insurance)
+            Total Current Liabilities
+            Long-Term Debt
+            Operating Lease Liabilities
+            Deferred Tax Liabilities
+            Other Liabilities
+            Total Liabilities
+            Common Stock
+            Additional Paid-In Capital
+            Retained Earnings
+            Accumulated Other Comprehensive Income / (Loss)
+            Treasury Stock
+            Non-Controlling Interests
+            Total Stockholders' Equity
+            Total Liabilities and Stockholders' Equity
+
+        Cash Flow Statement:
+            Net Income (starting line)
+            Depreciation & Amortization
+            Stock-Based Compensation
+            Deferred Income Taxes
+            Changes in Working Capital (with sub-items)
+            Net Cash Provided by Operating Activities
+            Capital Expenditures / Purchases of PP&E
+            Acquisitions, net of cash acquired
+            Purchases / Proceeds of Investments
+            Net Cash Used in Investing Activities
+            Proceeds from / Repayment of Debt
+            Issuance / Repurchase of Common Stock
+            Dividends Paid
+            Net Cash Used in Financing Activities
+            Effect of Exchange Rate Changes on Cash
+            Net Change in Cash
+            Cash at Beginning of Period
+            Cash at End of Period
+
+        Per-Share / Other:
+            Shares Outstanding (period-end)
+            Treasury Shares
+            Book Value per Share
+            Dividends Declared per Share
+
+FR-3.2  Extraction MUST not be limited to the canonical names above. The
+        system MUST capture issuer-specific line item labels verbatim and map
+        them to a canonical taxonomy via a configurable label-to-canonical
+        dictionary, with confidence score and ability to flag unmapped items
+        for human review.
+
+FR-3.3  Each extracted line item MUST carry the following fields:
+        - canonical_name              (mapped taxonomy key)
+        - reported_label              (verbatim text from the document)
+        - value                       (raw numeric value as printed)
+        - normalized_value            (value * scale, in base currency units)
+        - sign                        (positive / negative as printed,
+                                       including parenthetical negatives)
+        - currency                    (ISO 4217, e.g. USD, EUR, GBP, JPY)
+        - scale                       (units, hundreds, thousands, millions,
+                                       billions, percent, basis points)
+        - period_type                 (annual, quarterly, year-to-date,
+                                       trailing-twelve-months, point-in-time)
+        - period_start_date           (for flow items)
+        - period_end_date             (for stock items)
+        - fiscal_year, fiscal_quarter
+        - consolidation_level         (consolidated, parent-only, segment,
+                                       geographic, business-line)
+        - segment_id                  (when consolidation_level != consolidated)
+        - reporting_framework         (US-GAAP, IFRS, statutory, other)
+        - restatement_flag            (as-reported, restated, reclassified)
+        - audit_status                (audited, reviewed, unaudited)
+        - source_document_id
+        - source_section              (e.g. "Consolidated Statements of Income")
+        - source_page                 (page number in PDF)
+        - source_bbox                 (bounding box on the source page)
+        - source_table_id             (table identifier within the section)
+        - extraction_method           (vision-llm, text-llm, xbrl, ocr)
+        - confidence                  (0.0 - 1.0)
+        - extracted_at                (UTC timestamp)
+        - model_version               (LLM model + prompt version hash)
+
+FR-3.4  The system MUST capture multi-period columns presented in a single
+        table (e.g. "Three Months Ended March 31, 2025 / 2024" produces two
+        rows per line item, one per period).
+
+FR-3.5  The system MUST distinguish CONSOLIDATED data from SEGMENT data and
+        store both. Segment data MUST be linked to its parent consolidated
+        view via segment_id and segment_dimension (business / geography /
+        product).
+
+FR-3.6  The system MUST detect and correctly handle:
+        - Parenthetical negatives:    (1,234)  ->  -1234
+        - Dash / em-dash placeholders for zero or N/A
+        - Footnote markers:           1,234(a)  -> value 1234, footnote_ref a
+        - Restated columns and "as previously reported" columns
+        - "n/m" (not meaningful), "*" (rounding), "-" (zero or null)
+        - Currency symbols mixed in cells ($, €, £, ¥, ₹)
+        - Mixed scales within a single table (e.g. EPS in actuals while the
+          rest of the table is in millions)
+
+================================================================================
+4. METADATA & SCALING NORMALIZATION
+================================================================================
+
+FR-4.1  The system MUST detect the table-level scale declaration from any of:
+        "(in millions)", "(in thousands, except per share)", "(US$ millions)",
+        "(amounts in INR crore)", "(图片)", and apply it correctly to every
+        cell in the table unless overridden by a row-level note (e.g. EPS).
+
+FR-4.2  The system MUST detect and store the reporting currency from:
+        - explicit table headers ("US$ millions", "in EUR thousands")
+        - issuer's functional / presentation currency from cover page
+        - footnote currency disclosures
+
+FR-4.3  Where a document is reported in multiple currencies (e.g. USD primary
+        with EUR convenience translation), the system MUST capture both and
+        flag which is the primary presentation currency.
+
+FR-4.4  The system MUST resolve relative period labels into absolute dates,
+        e.g. "Three Months Ended March 31" -> period_start_date = 2025-01-01,
+        period_end_date = 2025-03-31, period_type = quarterly.
+
+FR-4.5  The system MUST distinguish:
+        - flow items   (revenue, cash flow)        -> period_start + period_end
+        - stock items  (balance sheet, shares o/s) -> period_end (point-in-time)
+
+FR-4.6  Non-calendar fiscal years MUST be handled (e.g. fiscal year ending
+        in January for retailers, in June for some non-US issuers).
+
+================================================================================
+5. RELATIONSHIP / IDENTITY VALIDATION
+================================================================================
+
+FR-5.1  The system MUST maintain a sector-aware Mathematical Relationship
+        Hierarchy (see Pipeline Design.md, section "Relationship Hierarchy")
+        that defines parent / child roll-up identities for each statement.
+
+FR-5.2  After extraction, every parent-child identity in the hierarchy MUST
+        be evaluated. Examples:
+        - Net Income = Income Before Tax - Income Tax Expense
+        - Total Assets = Total Current Assets + Total Non-Current Assets
+        - Total Assets = Total Liabilities + Total Stockholders' Equity
+        - Net Change in Cash = CFO + CFI + CFF + FX Effect
+        - Gross Profit = Revenue - Cost of Revenue
+        - Total Net Revenue (bank) = Net Interest Income + Non-Interest Income
+        - Income Before Tax (bank) = Net Revenue - Provision - Non-Interest Exp.
+
+FR-5.3  Identity checks MUST tolerate rounding within +/- the smallest unit
+        implied by the table's scale (e.g. +/- $1M when reported in millions),
+        configurable per identity.
+
+FR-5.4  Failed identities MUST NOT silently overwrite extracted values.
+        Failures MUST produce a validation_issue record with:
+        - identity_id, expected_value, computed_value, delta, tolerance,
+          contributing line items, and remediation status.
+
+FR-5.5  When a parent line item is missing but all children are present
+        (and vice versa), the system MUST mark the missing item as
+        "derivable" and store the derived value separately from the extracted
+        value, never overwriting an extracted value with a derived one.
+
+FR-5.6  The relationship hierarchy MUST be versioned and editable without
+        code changes (declarative YAML / JSON).
+
+================================================================================
+6. OUTPUT & STORAGE
+================================================================================
+
+FR-6.1  Extracted facts MUST be persisted in a normalized fact store with the
+        schema described in FR-3.3, keyed by:
+        (issuer_id, canonical_name, period_end_date, period_type,
+         consolidation_level, segment_id, restatement_flag).
+
+FR-6.2  The system MUST preserve as-reported values AND normalized values
+        side by side. As-reported is the source of truth; normalized values
+        are derived (currency scale, sign convention, taxonomy mapping).
+
+FR-6.3  The system MUST support point-in-time queries: "what was reported as
+        of date D" must return the values present in the latest filing whose
+        filing_date <= D, with restated values accessible separately.
+
+FR-6.4  The system MUST emit machine-readable output in at least:
+        - JSON (per-document fact bundle)
+        - Parquet (analytical fact table)
+        - CSV (human review)
+
+FR-6.5  Every extracted fact MUST be traceable end-to-end: a user MUST be
+        able to click a value and see the source page, bounding box, and
+        the LLM prompt + response that produced it.
+
+================================================================================
+7. HUMAN-IN-THE-LOOP REVIEW
+================================================================================
+
+FR-7.1  The system MUST surface a review queue for facts where:
+        - confidence < configurable threshold (default 0.85)
+        - identity validation failed and could not be reconciled
+        - canonical mapping is ambiguous or unmapped
+        - scale / currency could not be determined
+        - the value differs by > X% from the prior period without disclosure
+
+FR-7.2  Reviewers MUST be able to accept, edit, or reject facts. Every edit
+        MUST be audit-logged with reviewer_id, timestamp, before/after values,
+        and reason code.
+
+FR-7.3  Reviewer corrections MUST be fed back as labeled training data for
+        prompt tuning, fine-tuning, and taxonomy mapping improvement.
+
+================================================================================
+8. RE-EXTRACTION & RESTATEMENT HANDLING
+================================================================================
+
+FR-8.1  When a new filing supersedes an earlier one (10-K restating prior
+        10-Qs, or amended 10-K/A), the system MUST:
+        - retain the prior extracted facts immutably
+        - extract the new filing as a separate version
+        - link them via restatement_chain_id
+        - flag deltas above tolerance for analyst review
+
+FR-8.2  The system MUST support full re-extraction of any document on demand
+        (e.g. after an extraction model upgrade) without losing history.
+
+================================================================================
+9. SECURITY, ACCESS & AUDIT
+================================================================================
+
+FR-9.1  All access to documents and facts MUST be authenticated and
+        role-based (ingest, extract, review, read-only).
+
+FR-9.2  Every read and write of a fact MUST be audit-logged.
+
+FR-9.3  The system MUST not transmit document content to any LLM provider
+        not on the approved list, and MUST honor data-residency
+        configuration per issuer / per tenant.
+
+================================================================================
+10. APIs
+================================================================================
+
+FR-10.1 The system MUST expose REST / gRPC endpoints for:
+        - submit_document(document, metadata) -> document_id
+        - get_document_status(document_id)
+        - get_facts(issuer, period, canonical_names[]) -> facts[]
+        - get_validation_issues(document_id) -> issues[]
+        - submit_review(fact_id, decision, value, reason) -> ack
+
+FR-10.2 The system MUST expose a streaming events feed for downstream
+        consumers: fact.created, fact.updated, document.completed,
+        validation.failed, review.completed.
+
+================================================================================
+END OF FUNCTIONAL REQUIREMENTS
+================================================================================
